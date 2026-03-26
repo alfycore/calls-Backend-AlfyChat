@@ -304,10 +304,44 @@ async function start() {
       connectionLimit: 10,
     });
 
-    redis = new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: parseInt(process.env.REDIS_PORT || '6379'),
-      password: process.env.REDIS_PASSWORD,
+    const redisHost = process.env.REDIS_HOST || 'localhost';
+    const redisPort = parseInt(process.env.REDIS_PORT || '6379');
+    const redisPassword = process.env.REDIS_PASSWORD || undefined;
+
+    const redisOptions = {
+      host: redisHost,
+      port: redisPort,
+      password: redisPassword,
+      connectTimeout: 5000,
+      // Allow ioredis to retry with backoff
+      retryStrategy: (times: number) => Math.min(50 + times * 50, 2000),
+      // Let ioredis decide reconnection on certain errors
+      reconnectOnError: (err: Error) => {
+        if (!err) return false;
+        // reconnect on network/timeouts or if Redis replies READONLY
+        const msg = err.message || '';
+        return /ETIMEDOUT|ECONNREFUSED|READONLY/.test(msg);
+      },
+      maxRetriesPerRequest: null,
+    } as any;
+
+    redis = new Redis(redisOptions);
+
+    // Attach event handlers to avoid unhandled error events and log state
+    redis.on('error', (err: Error) => {
+      logger.error('Redis error', err);
+    });
+    redis.on('connect', () => {
+      logger.info('Redis connecting', { host: redisHost, port: redisPort });
+    });
+    redis.on('ready', () => {
+      logger.info('Redis ready');
+    });
+    redis.on('close', () => {
+      logger.warn('Redis connection closed');
+    });
+    redis.on('reconnecting', (time: number) => {
+      logger.warn(`Redis reconnecting in ${time}ms`);
     });
 
     // Migration des tables
