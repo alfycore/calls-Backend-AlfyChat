@@ -164,14 +164,9 @@ app.post('/calls/:callId/join', async (req, res) => {
       [callId]
     );
 
-    // Mettre à jour Redis
-    const cached = await redis.get(`call:${callId}`);
-    if (cached) {
-      const call = JSON.parse(cached);
-      if (!call.participants.includes(userId)) call.participants.push(userId);
-      call.status = 'ongoing';
-      await redis.setex(`call:${callId}`, 3600, JSON.stringify(call));
-    }
+    // Invalider le cache Redis — la prochaine lecture reconstruira depuis la DB
+    // (évite le race condition get-modify-set entre plusieurs instances)
+    await redis.del(`call:${callId}`);
 
     logger.info(`${userId} a rejoint l'appel ${callId}`);
     res.json({ success: true });
@@ -231,15 +226,9 @@ app.post('/calls/:callId/leave', async (req, res) => {
         "UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = ?",
         [callId]
       );
-      await redis.del(`call:${callId}`);
-    } else {
-      const cached = await redis.get(`call:${callId}`);
-      if (cached) {
-        const call = JSON.parse(cached);
-        call.participants = call.participants.filter((p: string) => p !== userId);
-        await redis.setex(`call:${callId}`, 3600, JSON.stringify(call));
-      }
     }
+    // Invalider le cache dans tous les cas — évite le race condition entre instances
+    await redis.del(`call:${callId}`);
 
     logger.info(`${userId} a quitté l'appel ${callId}`);
     res.json({ success: true });
@@ -297,9 +286,15 @@ app.get('/calls/history/:userId', async (req, res) => {
   }
 });
 
-// Health
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'calls' });
+// Health — vérifie MySQL et Redis pour que le load balancer route correctement
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.execute('SELECT 1');
+    await redis.ping();
+    res.json({ status: 'ok', service: 'calls' });
+  } catch (error) {
+    res.status(503).json({ status: 'error', service: 'calls', detail: (error as Error).message });
+  }
 });
 
 // ============ DÉMARRAGE ============
@@ -312,7 +307,7 @@ async function start() {
       user: process.env.DB_USER || 'alfychat',
       password: process.env.DB_PASSWORD || 'alfychat',
       database: process.env.DB_NAME || 'alfychat',
-      connectionLimit: 10,
+      connectionLimit: parseInt(process.env.DB_POOL_SIZE || '5'),
     });
 
     const redisHost = process.env.REDIS_HOST || 'localhost';
@@ -381,6 +376,18 @@ async function start() {
         PRIMARY KEY (call_id, user_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    // Index pour accélérer les requêtes multi-instances à l'échelle
+    await pool.execute(`
+      ALTER TABLE call_participants
+        ADD INDEX IF NOT EXISTS idx_user_id (user_id),
+        ADD INDEX IF NOT EXISTS idx_call_active (call_id, left_at)
+    `).catch(() => { /* index existe déjà */ });
+
+    await pool.execute(`
+      ALTER TABLE calls
+        ADD INDEX IF NOT EXISTS idx_status (status)
+    `).catch(() => { /* index existe déjà */ });
 
     const PORT = process.env.PORT || 3004;
     app.listen(PORT, () => {
