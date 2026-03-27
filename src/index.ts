@@ -14,8 +14,19 @@ import winston from 'winston';
 
 dotenv.config();
 
+const _allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || 'http://localhost:4000')
+  .split(',').map((o) => o.trim());
+
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
+    if (_allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origine non autorisée — ${origin}`));
+  },
+  credentials: true,
+}));
 app.use(helmet());
 app.use(express.json());
 
