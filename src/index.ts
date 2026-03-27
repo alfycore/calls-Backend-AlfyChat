@@ -11,6 +11,7 @@ import { v4 as uuidv4 } from 'uuid';
 import mysql, { Pool, RowDataPacket } from 'mysql2/promise';
 import Redis from 'ioredis';
 import winston from 'winston';
+import { AccessToken } from 'livekit-server-sdk';
 
 dotenv.config();
 
@@ -259,6 +260,139 @@ app.post('/calls/:callId/end', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     logger.error('Erreur fin appel:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ APPELS GROUPE (LiveKit SFU) ============
+// Les appels groupe utilisent LiveKit comme SFU (Selective Forwarding Unit),
+// contrairement aux appels DM qui utilisent le WebRTC P2P mesh existant.
+// Variables d'environnement requises : LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_WS_URL
+
+function buildLiveKitToken(participantId: string, participantName: string, roomName: string): string {
+  const apiKey    = process.env.LIVEKIT_API_KEY;
+  const apiSecret = process.env.LIVEKIT_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error('LIVEKIT_API_KEY / LIVEKIT_API_SECRET non configurés');
+
+  const token = new AccessToken(apiKey, apiSecret, {
+    identity: participantId,
+    name: participantName,
+    ttl: '4h',
+  });
+  token.addGrant({
+    roomJoin: true,
+    room: roomName,
+    canPublish: true,
+    canSubscribe: true,
+    canPublishData: true,
+  });
+  return token.toJwt() as unknown as string;
+}
+
+// POST /calls/group/room — Créer une room LiveKit pour un appel groupe (initiateur)
+app.post('/calls/group/room', async (req, res) => {
+  try {
+    const { channelId, participantId, participantName, type } = req.body;
+
+    if (!channelId || !participantId) {
+      return res.status(400).json({ error: 'channelId et participantId requis' });
+    }
+
+    const callId   = uuidv4();
+    const roomName = `group_${channelId}_${callId}`;
+    const wsUrl    = process.env.LIVEKIT_WS_URL;
+
+    if (!wsUrl || !process.env.LIVEKIT_API_KEY) {
+      return res.status(503).json({
+        error: 'LiveKit non configuré — définir LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_WS_URL',
+      });
+    }
+
+    const token = buildLiveKitToken(participantId, participantName || participantId, roomName);
+
+    // Stocker la session dans Redis (1h TTL)
+    const callData = {
+      id:          callId,
+      type:        type || 'voice',
+      channelId,
+      roomName,
+      wsUrl,
+      status:      'ringing',
+      initiatorId: participantId,
+      createdAt:   new Date().toISOString(),
+    };
+    await redis.setex(`group_call:${callId}`, 3600, JSON.stringify(callData));
+
+    // Enregistrer dans la DB pour l'historique
+    await pool.execute(
+      `INSERT INTO calls (id, type, initiator_id, channel_id, status)
+       VALUES (?, ?, ?, ?, 'ringing')`,
+      [callId, type || 'voice', participantId, channelId]
+    );
+    await pool.execute(
+      'INSERT INTO call_participants (call_id, user_id) VALUES (?, ?)',
+      [callId, participantId]
+    );
+
+    logger.info(`Appel groupe créé: ${callId} room=${roomName} par ${participantId}`);
+    res.status(201).json({ callId, roomName, token, wsUrl });
+  } catch (error) {
+    logger.error('Erreur création appel groupe:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// POST /calls/group/token — Rejoindre une room LiveKit existante (autres participants)
+app.post('/calls/group/token', async (req, res) => {
+  try {
+    const { callId, participantId, participantName } = req.body;
+
+    if (!callId || !participantId) {
+      return res.status(400).json({ error: 'callId et participantId requis' });
+    }
+
+    const cached = await redis.get(`group_call:${callId}`);
+    if (!cached) return res.status(404).json({ error: 'Appel groupe non trouvé ou expiré' });
+
+    const callData = JSON.parse(cached);
+
+    const token = buildLiveKitToken(participantId, participantName || participantId, callData.roomName);
+
+    // Marquer le participant dans la DB
+    await pool.execute(
+      'INSERT IGNORE INTO call_participants (call_id, user_id) VALUES (?, ?)',
+      [callId, participantId]
+    );
+    await pool.execute(
+      "UPDATE calls SET status = 'ongoing' WHERE id = ? AND status = 'ringing'",
+      [callId]
+    );
+
+    logger.info(`Token généré pour ${participantId} dans appel groupe ${callId}`);
+    res.json({ token, roomName: callData.roomName, wsUrl: callData.wsUrl });
+  } catch (error) {
+    logger.error('Erreur token appel groupe:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// POST /calls/group/:callId/end — Terminer un appel groupe
+app.post('/calls/group/:callId/end', async (req, res) => {
+  try {
+    const { callId } = req.params;
+    await redis.del(`group_call:${callId}`);
+    await pool.execute(
+      "UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = ?",
+      [callId]
+    );
+    await pool.execute(
+      'UPDATE call_participants SET left_at = NOW() WHERE call_id = ? AND left_at IS NULL',
+      [callId]
+    );
+    logger.info(`Appel groupe ${callId} terminé`);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur fin appel groupe:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
