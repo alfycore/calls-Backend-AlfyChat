@@ -12,7 +12,7 @@ import mysql, { Pool, RowDataPacket } from 'mysql2/promise';
 import Redis from 'ioredis';
 import winston from 'winston';
 import { AccessToken } from 'livekit-server-sdk';
-import { startServiceRegistration, serviceMetricsMiddleware } from './utils/service-client';
+import { startServiceRegistration, serviceMetricsMiddleware, collectServiceMetrics } from './utils/service-client';
 
 dotenv.config();
 
@@ -431,6 +431,16 @@ app.get('/health', async (_req, res) => {
   } catch (error) {
     res.status(503).json({ status: 'error', service: 'calls', detail: (error as Error).message });
   }
+});
+
+app.get('/metrics', (req, res) => {
+  res.json({
+    service: 'calls',
+    serviceId: process.env.SERVICE_ID || 'calls-default',
+    location: (process.env.SERVICE_LOCATION || 'EU').toUpperCase(),
+    ...collectServiceMetrics(),
+    uptime: process.uptime(),
+  });
 });
 
 // ============ DÉMARRAGE ============
