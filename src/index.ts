@@ -12,6 +12,7 @@ import mysql, { Pool, RowDataPacket } from 'mysql2/promise';
 import Redis from 'ioredis';
 import winston from 'winston';
 import { AccessToken } from 'livekit-server-sdk';
+import { startServiceRegistration, serviceMetricsMiddleware } from './utils/service-client';
 
 dotenv.config();
 
@@ -30,6 +31,7 @@ app.use(cors({
 }));
 app.use(helmet());
 app.use(express.json());
+app.use(serviceMetricsMiddleware);
 
 const logger = winston.createLogger({
   level: 'info',
@@ -526,6 +528,7 @@ async function start() {
     const PORT = process.env.PORT || 3004;
     app.listen(PORT, () => {
       logger.info(`🚀 Service Calls démarré sur le port ${PORT}`);
+      startServiceRegistration('calls');
     });
   } catch (error) {
     logger.error('Erreur au démarrage:', error);
