@@ -13,6 +13,7 @@ import Redis from 'ioredis';
 import winston from 'winston';
 import { AccessToken } from 'livekit-server-sdk';
 import { startServiceRegistration, serviceMetricsMiddleware, collectServiceMetrics } from './utils/service-client';
+import { authMiddleware, AuthRequest } from './middleware/auth';
 
 dotenv.config();
 
@@ -53,12 +54,13 @@ export function getRedis() {
 // ============ ROUTES ============
 
 // POST /calls — Initier un appel
-app.post('/calls', async (req, res) => {
+app.post('/calls', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { type, initiatorId, conversationId, channelId } = req.body;
+    const { type, conversationId, channelId } = req.body;
+    const initiatorId = req.userId;
 
     if (!type || !initiatorId) {
-      return res.status(400).json({ error: 'type et initiatorId requis' });
+      return res.status(400).json({ error: 'type requis et authentification nécessaire' });
     }
     if (!['voice', 'video'].includes(type)) {
       return res.status(400).json({ error: 'type doit être voice ou video' });
@@ -99,7 +101,7 @@ app.post('/calls', async (req, res) => {
 });
 
 // GET /calls/:callId — Récupérer un appel
-app.get('/calls/:callId', async (req, res) => {
+app.get('/calls/:callId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
 
@@ -140,11 +142,11 @@ app.get('/calls/:callId', async (req, res) => {
 });
 
 // POST /calls/:callId/join — Rejoindre un appel
-app.post('/calls/:callId/join', async (req, res) => {
+app.post('/calls/:callId/join', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ error: 'userId requis' });
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Authentification requise' });
 
     const [calls] = await pool.execute<RowDataPacket[]>(
       "SELECT * FROM calls WHERE id = ? AND status IN ('ringing', 'ongoing')",
@@ -180,10 +182,10 @@ app.post('/calls/:callId/join', async (req, res) => {
 });
 
 // POST /calls/:callId/reject — Refuser un appel
-app.post('/calls/:callId/reject', async (req, res) => {
+app.post('/calls/:callId/reject', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
-    const { userId } = req.body;
+    const userId = req.userId;
 
     // Vérifier s'il reste des participants
     const [active] = await pool.execute<RowDataPacket[]>(
@@ -208,10 +210,10 @@ app.post('/calls/:callId/reject', async (req, res) => {
 });
 
 // POST /calls/:callId/leave — Quitter un appel
-app.post('/calls/:callId/leave', async (req, res) => {
+app.post('/calls/:callId/leave', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
-    const { userId } = req.body;
+    const userId = req.userId;
 
     await pool.execute(
       'UPDATE call_participants SET left_at = NOW() WHERE call_id = ? AND user_id = ? AND left_at IS NULL',
@@ -242,9 +244,19 @@ app.post('/calls/:callId/leave', async (req, res) => {
 });
 
 // POST /calls/:callId/end — Terminer un appel
-app.post('/calls/:callId/end', async (req, res) => {
+app.post('/calls/:callId/end', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
+    const userId = req.userId;
+
+    // Vérifier que l'utilisateur est participant de l'appel
+    const [participants] = await pool.execute<RowDataPacket[]>(
+      'SELECT user_id FROM call_participants WHERE call_id = ? AND user_id = ?',
+      [callId, userId]
+    );
+    if (participants.length === 0) {
+      return res.status(403).json({ error: 'Non autorisé à terminer cet appel' });
+    }
 
     await pool.execute(
       "UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = ?",
@@ -279,7 +291,7 @@ function buildLiveKitToken(participantId: string, participantName: string, roomN
   const token = new AccessToken(apiKey, apiSecret, {
     identity: participantId,
     name: participantName,
-    ttl: '4h',
+    ttl: '30m',
   });
   token.addGrant({
     roomJoin: true,
@@ -292,12 +304,24 @@ function buildLiveKitToken(participantId: string, participantName: string, roomN
 }
 
 // POST /calls/group/room — Créer une room LiveKit pour un appel groupe (initiateur)
-app.post('/calls/group/room', async (req, res) => {
+app.post('/calls/group/room', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { channelId, participantId, participantName, type } = req.body;
+    const { channelId, participantName, type } = req.body;
+    const participantId = req.userId;
 
     if (!channelId || !participantId) {
-      return res.status(400).json({ error: 'channelId et participantId requis' });
+      return res.status(400).json({ error: 'channelId requis et authentification nécessaire' });
+    }
+
+    // Vérifier que le créateur est membre du serveur avant d'ouvrir la room.
+    const [chk] = await pool.execute<RowDataPacket[]>(
+      `SELECT 1 FROM channels c
+       JOIN server_members sm ON sm.server_id = c.server_id
+       WHERE c.id = ? AND sm.user_id = ? LIMIT 1`,
+      [channelId, participantId]
+    );
+    if ((chk as any[]).length === 0) {
+      return res.status(403).json({ error: 'Accès refusé: non membre du serveur' });
     }
 
     const callId   = uuidv4();
@@ -344,19 +368,41 @@ app.post('/calls/group/room', async (req, res) => {
   }
 });
 
+// Helper: vérifier qu'un utilisateur est membre du serveur propriétaire d'un channel
+async function userCanAccessChannel(userId: string, channelId: string): Promise<boolean> {
+  const [rows] = await pool.execute<RowDataPacket[]>(
+    `SELECT 1
+     FROM channels c
+     JOIN server_members sm ON sm.server_id = c.server_id
+     WHERE c.id = ? AND sm.user_id = ?
+     LIMIT 1`,
+    [channelId, userId]
+  );
+  return (rows as any[]).length > 0;
+}
+
 // POST /calls/group/token — Rejoindre une room LiveKit existante (autres participants)
-app.post('/calls/group/token', async (req, res) => {
+app.post('/calls/group/token', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { callId, participantId, participantName } = req.body;
+    const { callId, participantName } = req.body;
+    const participantId = req.userId;
 
     if (!callId || !participantId) {
-      return res.status(400).json({ error: 'callId et participantId requis' });
+      return res.status(400).json({ error: 'callId requis et authentification nécessaire' });
     }
 
     const cached = await redis.get(`group_call:${callId}`);
     if (!cached) return res.status(404).json({ error: 'Appel groupe non trouvé ou expiré' });
 
     const callData = JSON.parse(cached);
+
+    // Vérifier l'appartenance au serveur propriétaire du channel avant d'émettre un token LiveKit.
+    if (callData.channelId) {
+      const allowed = await userCanAccessChannel(participantId, callData.channelId);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Accès refusé: non membre du serveur' });
+      }
+    }
 
     const token = buildLiveKitToken(participantId, participantName || participantId, callData.roomName);
 
@@ -378,10 +424,30 @@ app.post('/calls/group/token', async (req, res) => {
   }
 });
 
-// POST /calls/group/:callId/end — Terminer un appel groupe
-app.post('/calls/group/:callId/end', async (req, res) => {
+// POST /calls/group/:callId/end — Terminer un appel groupe (initiateur uniquement)
+app.post('/calls/group/:callId/end', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
+    const userId = req.userId;
+
+    const cached = await redis.get(`group_call:${callId}`);
+    if (cached) {
+      const callData = JSON.parse(cached);
+      if (callData.initiatorId && callData.initiatorId !== userId) {
+        return res.status(403).json({ error: 'Seul l\'initiateur peut terminer l\'appel' });
+      }
+    } else {
+      // Fallback DB si la session Redis a expiré
+      const [rows] = await pool.execute<RowDataPacket[]>(
+        'SELECT initiator_id FROM calls WHERE id = ? LIMIT 1',
+        [callId]
+      );
+      const row = (rows as any[])[0];
+      if (row && row.initiator_id && row.initiator_id !== userId) {
+        return res.status(403).json({ error: 'Seul l\'initiateur peut terminer l\'appel' });
+      }
+    }
+
     await redis.del(`group_call:${callId}`);
     await pool.execute(
       "UPDATE calls SET status = 'ended', ended_at = NOW() WHERE id = ?",
@@ -400,9 +466,13 @@ app.post('/calls/group/:callId/end', async (req, res) => {
 });
 
 // GET /calls/history/:userId — Historique des appels
-app.get('/calls/history/:userId', async (req, res) => {
+app.get('/calls/history/:userId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { userId } = req.params;
+    // L'utilisateur ne peut voir que son propre historique
+    if (userId !== req.userId) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
     const limit = parseInt(req.query.limit as string) || 50;
 
     const [calls] = await pool.execute<RowDataPacket[]>(
