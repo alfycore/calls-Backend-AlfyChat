@@ -3,10 +3,13 @@
 // Gestion des appels vocaux et vidéo (WebRTC)
 // ==========================================
 
+import dotenv from 'dotenv';
+dotenv.config();
+import { registerGlobalErrorHandlers } from './utils/error-reporter';
+registerGlobalErrorHandlers();
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 import mysql, { Pool, RowDataPacket } from 'mysql2/promise';
 import Redis from 'ioredis';
