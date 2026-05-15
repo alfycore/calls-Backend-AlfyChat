@@ -3,50 +3,63 @@
 // ==========================================
 
 export type CallType = 'voice' | 'video';
-export type CallStatus = 'ringing' | 'active' | 'ended';
+export type CallStatus = 'ringing' | 'ongoing' | 'ended' | 'missed';
+export type CallCategory = 'dm' | 'group' | 'server';
+export type QualityTier = 0 | 1 | 2 | 3;
 
 export interface Call {
   id: string;
-  channelId?: string;
-  initiatorId: string;
   type: CallType;
+  callCategory: CallCategory;
+  initiatorId: string;
+  channelId?: string;
+  conversationId?: string;
+  serverId?: string;
   status: CallStatus;
+  currentQualityTier: QualityTier;
   startedAt: Date;
   endedAt?: Date;
-  participants: CallParticipant[];
+  participants: string[];
 }
 
 export interface CallParticipant {
-  id: string;
   callId: string;
   userId: string;
   joinedAt: Date;
   leftAt?: Date;
   isMuted: boolean;
-  isDeafened: boolean;
   isVideoEnabled: boolean;
-  user?: {
-    id: string;
-    username: string;
-    displayName: string;
-    avatarUrl?: string;
-  };
+  isScreenSharing: boolean;
 }
 
-export interface CreateCallDTO {
-  initiatorId: string;
-  channelId?: string;
-  participantIds: string[];
-  type: CallType;
+export interface ParticipantLimit {
+  scopeType: CallCategory;
+  scopeId: string;
+  maxParticipants: number;
 }
 
-export interface JoinCallDTO {
+export interface QualityEvent {
   callId: string;
-  userId: string;
+  tier: QualityTier;
+  reason: 'participant_count' | 'network_degraded';
+  participantCount: number;
 }
 
-export interface UpdateParticipantDTO {
-  isMuted?: boolean;
-  isDeafened?: boolean;
-  isVideoEnabled?: boolean;
+export interface CreateDmCallDTO {
+  type: CallType;
+  initiatorId: string;
+  conversationId?: string;
+}
+
+export interface CreateGroupCallDTO {
+  type: CallType;
+  initiatorId: string;
+  channelId: string;
+}
+
+export interface CreateServerCallDTO {
+  type: CallType;
+  initiatorId: string;
+  channelId: string;
+  serverId: string;
 }

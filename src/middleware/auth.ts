@@ -27,12 +27,12 @@ export interface AuthRequest extends Request {
 export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
   // Bypass interne : requêtes provenant du gateway avec x-internal-secret
   const internalSecret = req.headers['x-internal-secret'] as string | undefined;
-  if (internalSecret && safeCompare(internalSecret, INTERNAL_SECRET)) {
+  const match = !!(internalSecret && safeCompare(internalSecret, INTERNAL_SECRET));
+  if (match) {
+    // Internal service call — x-user-id is optional (read-only endpoints may omit it)
     const xUserId = req.headers['x-user-id'] as string | undefined;
-    if (xUserId) {
-      req.userId = xUserId;
-      return next();
-    }
+    req.userId = xUserId;
+    return next();
   }
 
   const token = req.headers.authorization?.replace('Bearer ', '');
