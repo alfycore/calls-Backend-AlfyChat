@@ -4,7 +4,18 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { getDatabase, getRedis } from '../index';
-import { Call, CallParticipant, CreateCallDTO, UpdateParticipantDTO } from '../types/call';
+import { Call, CallParticipant, CreateDmCallDTO } from '../types/call';
+
+interface CreateCallDTO extends CreateDmCallDTO {
+  channelId?: string;
+  participantIds: string[];
+}
+
+interface UpdateParticipantDTO {
+  isMuted?: boolean;
+  isVideoEnabled?: boolean;
+  isScreenSharing?: boolean;
+}
 
 export class CallService {
   private get db() {
@@ -57,13 +68,17 @@ export class CallService {
 
     return {
       id: call.id,
+      type: call.type,
+      callCategory: call.call_category,
+      conversationId: call.conversation_id,
+      serverId: call.server_id,
       channelId: call.channel_id,
       initiatorId: call.initiator_id,
-      type: call.type,
       status: call.status,
+      currentQualityTier: call.current_quality_tier,
       startedAt: call.started_at,
       endedAt: call.ended_at,
-      participants,
+      participants: participants.map((p) => p.userId),
     };
   }
 
@@ -78,7 +93,7 @@ export class CallService {
     // Si c'est le premier à répondre (hors initiateur), démarrer l'appel
     if (call.status === 'ringing' && call.participants.length === 1) {
       await this.db.execute(
-        `UPDATE calls SET status = 'active' WHERE id = ?`,
+        `UPDATE calls SET status = 'ongoing' WHERE id = ?`,
         [callId]
       );
     }
@@ -134,13 +149,13 @@ export class CallService {
       updates.push('is_muted = ?');
       params.push(dto.isMuted);
     }
-    if (dto.isDeafened !== undefined) {
-      updates.push('is_deafened = ?');
-      params.push(dto.isDeafened);
-    }
     if (dto.isVideoEnabled !== undefined) {
       updates.push('is_video_enabled = ?');
       params.push(dto.isVideoEnabled);
+    }
+    if (dto.isScreenSharing !== undefined) {
+      updates.push('is_screen_sharing = ?');
+      params.push(dto.isScreenSharing);
     }
 
     if (updates.length > 0) {
@@ -166,36 +181,37 @@ export class CallService {
       const participants = await this.getParticipants(call.id);
       return {
         id: call.id,
+        type: call.type,
+        callCategory: call.call_category,
+        conversationId: call.conversation_id,
+        serverId: call.server_id,
         channelId: call.channel_id,
         initiatorId: call.initiator_id,
-        type: call.type,
         status: call.status,
+        currentQualityTier: call.current_quality_tier,
         startedAt: call.started_at,
         endedAt: call.ended_at,
-        participants,
+        participants: participants.map((p) => p.userId),
       };
     }));
   }
 
   // Helpers privés
   private async addParticipant(callId: string, userId: string): Promise<CallParticipant> {
-    const participantId = uuidv4();
-
     await this.db.execute(
-      `INSERT INTO call_participants (id, call_id, user_id)
-       VALUES (?, ?, ?)
+      `INSERT INTO call_participants (call_id, user_id)
+       VALUES (?, ?)
        ON DUPLICATE KEY UPDATE left_at = NULL`,
-      [participantId, callId, userId]
+      [callId, userId]
     );
 
     return {
-      id: participantId,
       callId,
       userId,
       joinedAt: new Date(),
       isMuted: false,
-      isDeafened: false,
       isVideoEnabled: false,
+      isScreenSharing: false,
     };
   }
 
@@ -209,20 +225,13 @@ export class CallService {
     );
 
     return (rows as any[]).map(p => ({
-      id: p.id,
       callId: p.call_id,
       userId: p.user_id,
       joinedAt: p.joined_at,
       leftAt: p.left_at,
       isMuted: Boolean(p.is_muted),
-      isDeafened: Boolean(p.is_deafened),
       isVideoEnabled: Boolean(p.is_video_enabled),
-      user: {
-        id: p.user_id,
-        username: p.username,
-        displayName: p.display_name,
-        avatarUrl: p.avatar_url,
-      },
+      isScreenSharing: Boolean(p.is_screen_sharing),
     }));
   }
 }

@@ -585,8 +585,8 @@ async function start() {
       port: redisPort,
       password: redisPassword,
       connectTimeout: 5000,
-      retryStrategy: (times) => Math.min(50 + times * 50, 2000),
-      reconnectOnError: (err) => /ETIMEDOUT|ECONNREFUSED|READONLY/.test(err.message || ''),
+      retryStrategy: (times: number) => Math.min(50 + times * 50, 2000),
+      reconnectOnError: (err: Error) => /ETIMEDOUT|ECONNREFUSED|READONLY/.test(err.message || ''),
       maxRetriesPerRequest: null,
     } as any);
 
