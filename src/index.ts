@@ -501,6 +501,7 @@ app.post('/calls/:callId/leave', authMiddleware, async (req: AuthRequest, res) =
   try {
     const { callId } = req.params;
     const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Authentification requise' });
 
     await pool.execute(
       'UPDATE call_participants SET left_at = NOW() WHERE call_id = ? AND user_id = ? AND left_at IS NULL',
@@ -530,6 +531,7 @@ app.post('/calls/:callId/end', authMiddleware, async (req: AuthRequest, res) => 
   try {
     const { callId } = req.params;
     const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Authentification requise' });
 
     const [participants] = await pool.execute<RowDataPacket[]>(
       'SELECT user_id FROM call_participants WHERE call_id = ? AND user_id = ?',
