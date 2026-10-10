@@ -43,7 +43,7 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET as string) as unknown as { userId: string };
+    const decoded = jwt.verify(token, JWT_SECRET as string, { algorithms: ['HS256'] }) as unknown as { userId: string };
     req.userId = decoded.userId;
     next();
   } catch {

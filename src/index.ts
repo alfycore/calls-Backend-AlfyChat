@@ -109,6 +109,48 @@ app.get('/metrics', (_req, res) => {
   });
 });
 
+// ============ AUTORISATION ============
+// Le service n'appliquait AUCUN contrôle d'appartenance : n'importe quel compte
+// créait un appel dans la conversation ou le salon d'autrui, rejoignait
+// n'importe quel appel (puis recevait la signalisation et les flux), ou en
+// refusait un. La base étant partagée, l'appartenance se vérifie en SQL.
+
+const DM_ID_RE = /^dm_([0-9a-f-]{36})_([0-9a-f-]{36})$/i;
+
+async function isConversationMember(userId: string, conversationId: string | null | undefined): Promise<boolean> {
+  if (!conversationId || !userId) return false;
+  const m = DM_ID_RE.exec(conversationId);
+  if (m) return m[1] === userId || m[2] === userId;
+  const [rows] = await pool.execute<RowDataPacket[]>(
+    'SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ? LIMIT 1',
+    [conversationId, userId]
+  );
+  return rows.length > 0;
+}
+
+async function isServerMember(userId: string, serverId: string | null | undefined): Promise<boolean> {
+  if (!serverId || !userId) return false;
+  const [rows] = await pool.execute<RowDataPacket[]>(
+    `SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?
+     UNION SELECT 1 FROM servers WHERE id = ? AND owner_id = ? LIMIT 1`,
+    [serverId, userId, serverId, userId]
+  );
+  return rows.length > 0;
+}
+
+/** L'utilisateur a-t-il le droit de voir / rejoindre cet appel ? */
+async function canAccessCall(userId: string, call: RowDataPacket | Record<string, any>): Promise<boolean> {
+  const category = call.call_category ?? call.callCategory;
+  if (category === 'server') return isServerMember(userId, call.server_id ?? call.serverId);
+  if (category === 'group') return isConversationMember(userId, call.channel_id ?? call.channelId);
+  return isConversationMember(userId, call.conversation_id ?? call.conversationId);
+}
+
+async function loadCall(callId: string): Promise<RowDataPacket | null> {
+  const [rows] = await pool.execute<RowDataPacket[]>('SELECT * FROM calls WHERE id = ?', [callId]);
+  return rows[0] ?? null;
+}
+
 // ============ ROUTES SPÉCIFIQUES (avant les routes paramétrées) ============
 
 // GET /calls/history/:userId — historique des appels d'un utilisateur
@@ -163,13 +205,16 @@ app.post('/calls/dm', authMiddleware, async (req: AuthRequest, res) => {
     if (!type || !['voice', 'video'].includes(type)) {
       return res.status(400).json({ error: "type doit être 'voice' ou 'video'" });
     }
+    if (!(await isConversationMember(initiatorId, conversationId))) {
+      return res.status(403).json({ error: 'Accès non autorisé à cette conversation' });
+    }
 
     const callId = uuidv4();
 
     await pool.execute(
       `INSERT INTO calls (id, type, call_category, initiator_id, conversation_id, status)
        VALUES (?, ?, 'dm', ?, ?, 'ringing')`,
-      [callId, type, initiatorId, conversationId || null]
+      [callId, type, initiatorId, conversationId]
     );
     await pool.execute(
       'INSERT INTO call_participants (call_id, user_id) VALUES (?, ?)',
@@ -200,6 +245,9 @@ app.post('/calls/group', authMiddleware, async (req: AuthRequest, res) => {
 
     if (!channelId || !initiatorId) {
       return res.status(400).json({ error: 'channelId requis et authentification nécessaire' });
+    }
+    if (!(await isConversationMember(initiatorId, channelId))) {
+      return res.status(403).json({ error: 'Accès non autorisé à ce groupe' });
     }
 
     const callId = uuidv4();
@@ -237,6 +285,16 @@ app.post('/calls/server', authMiddleware, async (req: AuthRequest, res) => {
 
     if (!channelId || !serverId || !initiatorId) {
       return res.status(400).json({ error: 'channelId et serverId requis' });
+    }
+    if (!(await isServerMember(initiatorId, serverId))) {
+      return res.status(403).json({ error: 'Vous n\'êtes pas membre de ce serveur' });
+    }
+    // Le salon doit appartenir au serveur quand il est connu en base (les
+    // serveurs auto-hébergés gardent leurs salons sur leur node : le gateway
+    // vérifie dans ce cas).
+    const [chanRows] = await pool.execute<RowDataPacket[]>('SELECT server_id FROM channels WHERE id = ?', [channelId]);
+    if (chanRows.length > 0 && chanRows[0].server_id !== serverId) {
+      return res.status(403).json({ error: 'Ce salon n\'appartient pas à ce serveur' });
     }
 
     // Vérifier si un appel actif existe déjà sur ce canal
@@ -286,13 +344,16 @@ app.post('/calls', authMiddleware, async (req: AuthRequest, res) => {
     if (!type || !['voice', 'video'].includes(type)) {
       return res.status(400).json({ error: "type doit être 'voice' ou 'video'" });
     }
+    if (!(await isConversationMember(initiatorId, conversationId))) {
+      return res.status(403).json({ error: 'Accès non autorisé à cette conversation' });
+    }
 
     const callId = uuidv4();
 
     await pool.execute(
       `INSERT INTO calls (id, type, call_category, initiator_id, conversation_id, status)
        VALUES (?, ?, 'dm', ?, ?, 'ringing')`,
-      [callId, type, initiatorId, conversationId || null]
+      [callId, type, initiatorId, conversationId]
     );
     await pool.execute(
       'INSERT INTO call_participants (call_id, user_id) VALUES (?, ?)',
@@ -322,9 +383,6 @@ app.get('/calls/:callId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { callId } = req.params;
 
-    const cached = await redis.get(`call:${callId}`);
-    if (cached) return res.json(JSON.parse(cached));
-
     const [calls] = await pool.execute<RowDataPacket[]>(
       'SELECT * FROM calls WHERE id = ?',
       [callId]
@@ -333,6 +391,14 @@ app.get('/calls/:callId', authMiddleware, async (req: AuthRequest, res) => {
     if (calls.length === 0) {
       return res.status(404).json({ error: 'Appel non trouvé' });
     }
+    // Lecture réservée aux ayants droit (les appels internes sans x-user-id
+    // — le gateway — passent).
+    if (req.userId && !(await canAccessCall(req.userId, calls[0]))) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
+
+    const cached = await redis.get(`call:${callId}`);
+    if (cached) return res.json(JSON.parse(cached));
 
     const [participants] = await pool.execute<RowDataPacket[]>(
       'SELECT user_id FROM call_participants WHERE call_id = ? AND left_at IS NULL',
@@ -367,10 +433,13 @@ app.get('/calls/:callId/quality', authMiddleware, async (req: AuthRequest, res) 
     const { callId } = req.params;
 
     const [calls] = await pool.execute<RowDataPacket[]>(
-      'SELECT call_category, current_quality_tier FROM calls WHERE id = ?',
+      'SELECT * FROM calls WHERE id = ?',
       [callId]
     );
     if (calls.length === 0) return res.status(404).json({ error: 'Appel non trouvé' });
+    if (req.userId && !(await canAccessCall(req.userId, calls[0]))) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
 
     const participantCount = await countActiveParticipants(callId);
     res.json({
@@ -437,6 +506,10 @@ app.post('/calls/:callId/join', authMiddleware, async (req: AuthRequest, res) =>
     const call = calls[0];
     const category = call.call_category as CallCategory;
 
+    if (!(await canAccessCall(userId, call))) {
+      return res.status(403).json({ error: 'Accès non autorisé à cet appel' });
+    }
+
     // Vérifier la limite de participants
     const currentCount = await countActiveParticipants(callId);
     const maxAllowed = await getParticipantLimit(category, call.server_id);
@@ -474,10 +547,19 @@ app.post('/calls/:callId/reject', authMiddleware, async (req: AuthRequest, res) 
   try {
     const { callId } = req.params;
     const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Authentification requise' });
+
+    // Seul un destinataire légitime peut refuser (n'importe quel compte
+    // pouvait marquer « manqué » l'appel d'autrui).
+    const call = await loadCall(callId);
+    if (!call) return res.status(404).json({ error: 'Appel non trouvé' });
+    if (call.initiator_id === userId || !(await canAccessCall(userId, call))) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
 
     const [active] = await pool.execute<RowDataPacket[]>(
       'SELECT user_id FROM call_participants WHERE call_id = ? AND user_id != ? AND left_at IS NULL',
-      [callId, userId || '']
+      [callId, userId]
     );
 
     if (active.length <= 1) {
@@ -533,9 +615,13 @@ app.post('/calls/:callId/end', authMiddleware, async (req: AuthRequest, res) => 
     const userId = req.userId;
     if (!userId) return res.status(401).json({ error: 'Authentification requise' });
 
+    // Participant ENCORE présent (ou initiateur) : un ancien participant ne
+    // doit pas pouvoir couper l'appel des autres après l'avoir quitté.
     const [participants] = await pool.execute<RowDataPacket[]>(
-      'SELECT user_id FROM call_participants WHERE call_id = ? AND user_id = ?',
-      [callId, userId]
+      `SELECT 1 FROM call_participants cp
+       JOIN calls c ON c.id = cp.call_id
+       WHERE cp.call_id = ? AND cp.user_id = ? AND (cp.left_at IS NULL OR c.initiator_id = ?)`,
+      [callId, userId, userId]
     );
     if (participants.length === 0) {
       return res.status(403).json({ error: 'Non autorisé à terminer cet appel' });
