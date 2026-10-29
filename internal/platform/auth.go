@@ -25,6 +25,14 @@ type Auth struct {
 	// InternalWithoutUser : un appel interne sans x-user-id passe quand même
 	// (userId vide), pour les routes en lecture seule du gateway.
 	InternalWithoutUser bool
+	// InternalDefaultUser : userId attribué à un appel interne sans x-user-id.
+	InternalDefaultUser string
+	// MissingMessage remplace « Token d'authentification requis ».
+	MissingMessage string
+	// NoExpired : un jeton expiré répond « Token invalide ».
+	NoExpired bool
+	// AllowNoUser : un jeton valide sans userId passe avec un userId vide.
+	AllowNoUser bool
 }
 
 // NewAuth refuse de démarrer sans JWT_SECRET ni INTERNAL_SECRET.
@@ -60,6 +68,10 @@ func (a *Auth) Require(next http.HandlerFunc) http.HandlerFunc {
 				next(w, WithUserID(r, uid))
 				return
 			}
+			if a.InternalDefaultUser != "" {
+				next(w, WithUserID(r, a.InternalDefaultUser))
+				return
+			}
 			if a.InternalWithoutUser {
 				next(w, r)
 				return
@@ -74,12 +86,16 @@ func (a *Auth) Require(next http.HandlerFunc) http.HandlerFunc {
 			token = strings.Replace(header, "Bearer ", "", 1)
 		}
 		if token == "" && (a.Loose || header == "" || !strings.HasPrefix(header, "Bearer ")) {
-			Error(w, http.StatusUnauthorized, "Token d'authentification requis")
+			msg := "Token d'authentification requis"
+			if a.MissingMessage != "" {
+				msg = a.MissingMessage
+			}
+			Error(w, http.StatusUnauthorized, msg)
 			return
 		}
 		claims, err := a.Verify(token)
 		if err != nil {
-			if !a.Loose && errors.Is(err, jwt.ErrTokenExpired) {
+			if !a.Loose && !a.NoExpired && errors.Is(err, jwt.ErrTokenExpired) {
 				Error(w, http.StatusUnauthorized, "Token expiré")
 				return
 			}
@@ -88,7 +104,7 @@ func (a *Auth) Require(next http.HandlerFunc) http.HandlerFunc {
 		}
 		uid, _ := claims["userId"].(string)
 		// En mode Loose, un jeton valide sans userId passe avec un userId vide.
-		if uid == "" && !a.Loose {
+		if uid == "" && !a.Loose && !a.AllowNoUser {
 			Error(w, http.StatusUnauthorized, "Token invalide")
 			return
 		}

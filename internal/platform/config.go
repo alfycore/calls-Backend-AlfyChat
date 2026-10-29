@@ -22,6 +22,12 @@ func LoadEnv() {
 	_ = godotenv.Load()
 }
 
+// LoadEnvOverride charge le .env en écrasant les variables déjà présentes
+// (dotenv.config({ override: true })).
+func LoadEnvOverride() {
+	_ = godotenv.Overload()
+}
+
 // Env renvoie la variable ou la valeur par défaut si elle est vide.
 func Env(key, def string) string {
 	if v := os.Getenv(key); v != "" {

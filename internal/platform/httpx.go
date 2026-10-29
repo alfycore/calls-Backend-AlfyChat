@@ -32,6 +32,7 @@ const (
 	ctxBody ctxKey = iota
 	ctxUserID
 	ctxQuery
+	ctxRaw
 )
 
 // Server regroupe le routeur et les réglages du pipeline.
@@ -49,6 +50,13 @@ type Server struct {
 	// NoCORS / NoHelmet : désactivent ces middlewares (services internes).
 	NoCORS   bool
 	NoHelmet bool
+	// SkipHelmet : chemins où helmet n'est pas appliqué (webhooks).
+	SkipHelmet func(*http.Request) bool
+	// SkipJSON : chemins dont le corps JSON n'est pas analysé (express.raw) ;
+	// les octets restent accessibles par RawBytes.
+	SkipJSON func(*http.Request) bool
+	// StrictLocalhost : refuse les origines localhost (NODE_ENV=production).
+	StrictLocalhost bool
 }
 
 func NewServer() *Server {
@@ -87,7 +95,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !s.NoHelmet {
+	if !s.NoHelmet && (s.SkipHelmet == nil || !s.SkipHelmet(r)) {
 		helmet(w.Header())
 	}
 
@@ -96,6 +104,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil || int64(len(body)) > s.BodyLimit {
 			s.ServeError(w, r, http.StatusInternalServerError)
 			return
+		}
+		if len(body) > 0 {
+			r = r.WithContext(context.WithValue(r.Context(), ctxRaw, body))
+		}
+		if s.SkipJSON != nil && s.SkipJSON(r) {
+			body = nil
 		}
 		if len(bytes.TrimSpace(body)) > 0 {
 			parsed, err := ParseJSON(body)
@@ -171,7 +185,8 @@ func isJSONRequest(r *http.Request) bool {
 
 func (s *Server) cors(w http.ResponseWriter, r *http.Request) (bool, error) {
 	origin := r.Header.Get("Origin")
-	if origin != "" && !localhostOrigin.MatchString(origin) && !contains(s.AllowedOrigins, origin) {
+	local := localhostOrigin.MatchString(origin) && !s.StrictLocalhost
+	if origin != "" && !local && !contains(s.AllowedOrigins, origin) {
 		return false, errors.New("CORS: origine non autorisée — " + origin)
 	}
 	h := w.Header()
@@ -390,6 +405,19 @@ func Body(r *http.Request) *Object {
 		return o
 	}
 	return O()
+}
+
+// RawBytes renvoie les octets exacts d'un corps JSON non vide (req.rawBody).
+func RawBytes(r *http.Request) []byte {
+	b, _ := r.Context().Value(ctxRaw).([]byte)
+	return b
+}
+
+// SendEmpty répond comme res.status(n).send(”) : corps vide, text/html.
+func SendEmpty(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(status)
 }
 
 // RawBody renvoie le corps JSON tel quel (objet, tableau ou nil).
