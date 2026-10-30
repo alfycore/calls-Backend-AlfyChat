@@ -2,8 +2,7 @@
 
 Microservice de gestion des appels audio/vidéo pour AlfyChat.
 
-![Node.js](https://img.shields.io/badge/Bun-1.2-black?logo=bun)
-![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)
 ![LiveKit](https://img.shields.io/badge/LiveKit-SFU-00A86B)
 ![License](https://img.shields.io/badge/License-Source_Available-blue)
 
@@ -15,9 +14,8 @@ Ce service gère les appels 1:1 et de groupe via le protocole WebRTC, avec [Live
 
 | Catégorie | Technologies |
 |-----------|-------------|
-| Runtime | Bun |
-| Langage | TypeScript |
-| API | Express |
+| Langage | Go 1.26 |
+| API | net/http (stdlib) |
 | Appels temps réel | LiveKit (SFU) |
 | Auth | JWT |
 | Cache | Redis |
@@ -40,7 +38,7 @@ Frontend (:4000)  →  Gateway (:3000)  →  Microservices
 
 ### Prérequis
 
-- [Bun](https://bun.sh/) ≥ 1.2
+- [Go](https://go.dev/) ≥ 1.26
 - MySQL 8
 - Redis 7
 - Serveur LiveKit
@@ -62,23 +60,23 @@ LIVEKIT_API_SECRET=
 SERVICE_REGISTRY_URL=http://gateway:3000
 ```
 
-### Installation
-
-```bash
-bun install
-```
-
 ### Développement
 
 ```bash
-bun run dev
+go run .
 ```
 
 ### Build production
 
 ```bash
-bun run build
-bun run start
+go build -o bin/service .
+./bin/service
+```
+
+### Tests
+
+```bash
+go test ./...
 ```
 
 ### Docker
@@ -90,14 +88,10 @@ docker compose up calls
 ## Structure du projet
 
 ```
-src/
-├── index.ts             # Point d'entrée
-├── controllers/         # Logique métier (appels, rooms LiveKit)
-├── routes/              # Définition des routes Express
-├── services/            # Services (LiveKit, DB, cache)
-├── middleware/          # Auth JWT, rate limiting
-├── types/               # Types TypeScript
-└── utils/               # Utilitaires
+main.go                  # Point d'entrée
+internal/
+├── calls/               # Routes, cache Redis, limites de participants
+└── platform/            # Socle commun aux services Go
 ```
 
 ## Contribution
